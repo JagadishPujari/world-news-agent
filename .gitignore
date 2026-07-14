@@ -1,0 +1,36 @@
+# Environment variables (never commit secrets)
+.env
+*.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+venv/
+env/
+ENV/
+.venv/
+
+# Node.js
+node_modules/
+dist/
+build/
+.next/
+
+# IDE and OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Postgres data volumes
+postgres/data/
