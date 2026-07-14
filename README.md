@@ -353,7 +353,7 @@ Vercel project, and add the backend env vars from `.env.example`).
 | Variable | Purpose | Example |
 |---|---|---|
 | `GEMINI_API_KEY` | Gemini LLM auth | `AIzaSy...` |
-| `GEMINI_MODEL_NAME` | Model to use | `gemini-1.5-pro` |
+| `GEMINI_MODEL_NAME` | Model to use | `gemini-3.5-flash` |
 | `LANGFUSE_SECRET_KEY` | Langfuse auth | `sk-lf-...` |
 | `LANGFUSE_PUBLIC_KEY` | Langfuse public key | `pk-lf-...` |
 | `LANGFUSE_HOST` | Langfuse endpoint | `https://cloud.langfuse.com` |

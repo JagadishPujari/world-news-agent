@@ -25,9 +25,17 @@ from models.responses import ChatResponse, DigestResponse, SimplifyResponse, New
 from observability.langfuse_config import get_langfuse_handler
 
 
-# Request-scoped ContextVars to capture structural data populated by tools
+# Request-scoped ContextVars to capture structural data populated by tools.
+# LangChain executes tools in a copied context, so re-assigning the var inside
+# a tool would be invisible to the request handler. Both vars therefore hold
+# MUTABLE containers that tools update in place (shared object across the
+# context copy) — never .set() them outside the per-request reset.
 news_items_var: ContextVar[List[NewsItem]] = ContextVar("news_items", default=[])
-workflow_used_var: ContextVar[WorkflowName] = ContextVar("workflow_used", default="conversation")
+workflow_used_var: ContextVar[dict] = ContextVar("workflow_used", default={"name": "conversation"})
+
+
+def _set_workflow(name: WorkflowName) -> None:
+    workflow_used_var.get()["name"] = name
 
 
 # ── LangChain Tool Definitions ────────────────────────────────
@@ -36,9 +44,9 @@ workflow_used_var: ContextVar[WorkflowName] = ContextVar("workflow_used", defaul
 def fetch_news_tool(topic: str, count: int = 5) -> str:
     """Retrieve news articles for a specific topic or search query. Returns the raw headlines and details."""
     items = fetch_news(topic, count=count)
-    # Store in context variable for API response
-    news_items_var.set(news_items_var.get() + items)
-    workflow_used_var.set("topic_news")
+    # Store in context variable for API response (mutate in place — see note above)
+    news_items_var.get().extend(items)
+    _set_workflow("topic_news")
     
     formatted = []
     for item in items:
@@ -68,7 +76,7 @@ def simplify_topic_tool(topic: str, complexity: str = "beginner") -> str:
 @tool
 def generate_digest_tool(topics: List[str], style: str = "simple", complexity: str = "beginner", reading_frequency: str = "medium") -> str:
     """Generate a cohesive daily digest newsletter compiled across multiple topics."""
-    workflow_used_var.set("daily_digest")
+    _set_workflow("daily_digest")
     digest, _ = generate_digest(topics, style, complexity, reading_frequency)
     return digest
 
@@ -76,7 +84,7 @@ def generate_digest_tool(topics: List[str], style: str = "simple", complexity: s
 @tool
 def extract_url_tool(url: str) -> str:
     """Extract plain text body content from a web page URL."""
-    workflow_used_var.set("url_ingestion")
+    _set_workflow("url_ingestion")
     return extract_content(url)
 
 
@@ -105,12 +113,20 @@ def run_agent(
     if preferences:
         state.preferences = preferences
 
-    # Reset ContextVars for this request
+    # Reset ContextVars for this request (fresh mutable containers)
     news_items_var.set([])
-    workflow_used_var.set("conversation")
+    workflow_used_var.set({"name": "conversation"})
 
     # Check for Gemini keys to determine execution path
     has_gemini = settings.gemini_api_key and settings.gemini_api_key != "your-gemini-api-key" and "your_api_key" not in settings.gemini_api_key
+
+    # gemini-3.x models require "thought signatures" on function calls, which
+    # langchain-google-genai <3 does not send — every tool-calling attempt
+    # fails with a 400 after retries. Route those models straight to the
+    # deterministic pipeline (still real news + real LLM summaries) instead of
+    # paying a failed agent attempt on every turn.
+    if has_gemini and settings.gemini_model_name.startswith(("gemini-3", "gemini-flash-latest", "gemini-pro-latest")):
+        has_gemini = False
 
     trace_id = None
     reply = ""
@@ -165,7 +181,7 @@ def run_agent(
             # Setup Langfuse Tracing Handler
             handler = get_langfuse_handler(
                 session_id=session_id,
-                workflow=workflow_used_var.get(),
+                workflow=workflow_used_var.get()["name"],
                 tags=["chat"],
             )
             callbacks = [handler] if handler else []
@@ -197,7 +213,10 @@ def run_agent(
             has_gemini = False
 
     if not has_gemini:
-        # Run Rule-based mock agent
+        # Run Rule-based mock agent. Discard any news items collected by a
+        # partially-failed agent run so the fallback doesn't duplicate cards.
+        news_items_var.get().clear()
+        workflow_used_var.get()["name"] = "conversation"
         reply = _run_mock_agent_logic(state, message)
 
     # 4. Save message pair in history
@@ -209,7 +228,7 @@ def run_agent(
         session_id=session_id,
         reply=reply,
         news_items=news_items_var.get(),
-        workflow_used=workflow_used_var.get(),
+        workflow_used=workflow_used_var.get()["name"],
         trace_id=trace_id
     )
 
@@ -231,7 +250,7 @@ def generate_session_digest(
     selected_style = style if style is not None else state.preferences.summary_style
     
     # Track workflow
-    workflow_used_var.set("daily_digest")
+    workflow_used_var.set({"name": "daily_digest"})
 
     # Generate
     digest, count = generate_digest(
@@ -265,13 +284,13 @@ def simplify_session_content(
 
     # Track workflow
     if url:
-        workflow_used_var.set("url_ingestion")
+        workflow_used_var.set({"name": "url_ingestion"})
         raw_text = extract_content(url)
         # Summarize the extracted URL content at the requested style level
         simplified = summarize_text(raw_text, level="simple" if selected_level == "beginner" else "detailed")
     else:
         # Just simplify the text/topic
-        workflow_used_var.set("conversation")
+        workflow_used_var.set({"name": "conversation"})
         simplified = simplify_topic(content, complexity=selected_level)
 
     # Save to chat history
@@ -298,7 +317,7 @@ def _run_mock_agent_logic(state: any, message: str) -> str:
     # 1. Route 2: URL Ingestion
     if url_match:
         url = url_match.group(0)
-        workflow_used_var.set("url_ingestion")
+        _set_workflow("url_ingestion")
         raw_text = extract_content(url)
         summary = summarize_text(raw_text, level=state.preferences.summary_style)
         return (
@@ -308,7 +327,7 @@ def _run_mock_agent_logic(state: any, message: str) -> str:
 
     # 2. Route 3: Daily Digest Request
     if "digest" in msg or "newsletter" in msg or "summary digest" in msg:
-        workflow_used_var.set("daily_digest")
+        _set_workflow("daily_digest")
         topics = state.preferences.topics if state.preferences.topics else ["politics", "technology", "climate"]
         digest, _ = generate_digest(
             topics=topics,
@@ -328,14 +347,14 @@ def _run_mock_agent_logic(state: any, message: str) -> str:
 
     if "news" in msg or "headlines" in msg or matched_topic:
         topic_to_fetch = matched_topic or "technology"
-        workflow_used_var.set("topic_news")
+        _set_workflow("topic_news")
         
         # Save preference in viewed topics
         session_store.record_viewed_topic(state.session_id, topic_to_fetch)
         
         items = fetch_news(topic_to_fetch, count=3)
         # Save to contextvar
-        news_items_var.set(items)
+        news_items_var.get().extend(items)
         
         reply_lines = [
             f"Here are the latest news updates for **{topic_to_fetch.capitalize()}**:\n",
@@ -362,7 +381,7 @@ def _run_mock_agent_logic(state: any, message: str) -> str:
         if not concept:
             concept = "geopolitical conflicts"
             
-        workflow_used_var.set("conversation")
+        _set_workflow("conversation")
         explanation = simplify_topic(concept, complexity=state.preferences.complexity)
         return (
             f"Here is a beginner-friendly explanation of **{concept}**:\n\n"
@@ -371,7 +390,7 @@ def _run_mock_agent_logic(state: any, message: str) -> str:
         )
 
     # 5. Generic Conversation
-    workflow_used_var.set("conversation")
+    _set_workflow("conversation")
     return (
         f"Hello! I am your AI News Companion. I remember your interests during this session.\n\n"
         f"Currently, your preferences are set to:\n"
